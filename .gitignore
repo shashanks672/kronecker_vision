@@ -1,0 +1,26 @@
+# Data & caches
+data/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Weights & outputs
+weights/*.pt
+figures/*.png
+results/*.json
+logs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Streamlit
+.streamlit/
+
+# Virtual env
+venv/
+.env/

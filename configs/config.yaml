@@ -1,0 +1,67 @@
+# Kronecker Patch Embedding Research Project Configuration
+# ========================================================
+
+# Dataset
+dataset:
+  name: CIFAR10
+  root: ./data
+  image_size: 32
+  num_classes: 10
+  mean: [0.4914, 0.4822, 0.4465]
+  std: [0.2470, 0.2435, 0.2616]
+
+# Patch settings (shared by ViT and KViT)
+patch:
+  size: 4          # 4x4 patches → 8x8 = 64 patches
+  in_channels: 3
+  # flattened patch dim = 4*4*3 = 48
+
+# Model dimensions
+model:
+  embed_dim: 128
+  depth: 6
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attn_dropout: 0.0
+  drop_path: 0.05
+
+# Kronecker Patch Embedding specifics
+kronecker:
+  local_feat_dim: 8      # dimension of each local feature vector e_i
+  pos_dim: 16            # dimension of each position embedding p_i
+  # local_feat_dim * pos_dim = 128 = embed_dim
+  num_local_features: 4  # number of local features extracted per patch
+  # MLP path: 48 → 64 → (num_local * local_feat_dim)
+
+# Training
+training:
+  batch_size: 128
+  epochs: 50
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 5
+  label_smoothing: 0.1
+  seed: 42
+  num_workers: 4
+  amp: true              # mixed precision
+
+# Optimizer / Scheduler
+optimizer:
+  name: AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: cosine
+  min_lr: 1.0e-6
+
+# Paths
+paths:
+  weights_dir: ./weights
+  logs_dir: ./logs
+  results_dir: ./results
+  figures_dir: ./figures
+
+# Device
+device: cuda   # will fallback to cpu if unavailable
