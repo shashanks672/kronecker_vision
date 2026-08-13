@@ -402,136 +402,10 @@ def entropy(probs: np.ndarray) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar collapse state
-# ─────────────────────────────────────────────────────────────────────────────
-
-if "sidebar_collapsed" not in st.session_state:
-    st.session_state.sidebar_collapsed = False
-
-# CSS: collapsed rail (~60px) + fixed expand button that always stays visible
-if st.session_state.sidebar_collapsed:
-    st.markdown("""
-    <style>
-    /* Narrow the Streamlit sidebar to a thin rail */
-    section[data-testid="stSidebar"] {
-        min-width: 60px !important;
-        max-width: 60px !important;
-        width: 60px !important;
-        overflow: hidden !important;
-    }
-    section[data-testid="stSidebar"] > div {
-        width: 60px !important;
-        padding: 0 !important;
-    }
-    /* Hide all normal sidebar content while collapsed */
-    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] > div {
-        opacity: 0 !important;
-        pointer-events: none !important;
-        height: 0 !important;
-        overflow: hidden !important;
-    }
-    /* Hide Streamlit's built-in collapse control (we use our own) */
-    button[kind="header"],
-    [data-testid="collapsedControl"] {
-        display: none !important;
-    }
-    /* Fixed expand (>>) button — always on top at left edge */
-    div.st-key-expand_sidebar,
-    div[data-testid="stButton"]:has(button[aria-label="Expand sidebar"]),
-    .kv-expand-wrap {
-        position: fixed !important;
-        left: 8px !important;
-        top: 80px !important;
-        z-index: 2147483647 !important;
-        width: 44px !important;
-    }
-    div.st-key-expand_sidebar button,
-    .kv-expand-wrap button {
-        width: 44px !important;
-        height: 44px !important;
-        border-radius: 10px !important;
-        background: linear-gradient(145deg, #1f6feb, #388bfd) !important;
-        color: #fff !important;
-        border: 1px solid rgba(88,166,255,0.5) !important;
-        font-size: 1.1rem !important;
-        font-weight: 700 !important;
-        box-shadow: 0 4px 18px rgba(56,139,253,0.35) !important;
-        padding: 0 !important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-else:
-    st.markdown("""
-    <style>
-    /* Ensure built-in control doesn't fight our custom toggle when expanded */
-    [data-testid="collapsedControl"] {
-        display: none !important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-# Floating expand button (main area) — only when collapsed; always visible via fixed CSS
-if st.session_state.sidebar_collapsed:
-    # Marker + button; CSS targets .st-key-expand_sidebar (Streamlit ≥1.33) and sibling patterns
-    exp_col = st.container()
-    with exp_col:
-        if st.button("≫", key="expand_sidebar", help="Expand sidebar", type="primary"):
-            st.session_state.sidebar_collapsed = False
-            st.rerun()
-    st.markdown("""
-    <style>
-    /* Stronger fixed positioning for the expand control */
-    div.st-key-expand_sidebar {
-        position: fixed !important;
-        left: 8px !important;
-        top: 80px !important;
-        z-index: 2147483647 !important;
-        width: 44px !important;
-        margin: 0 !important;
-    }
-    div.st-key-expand_sidebar button {
-        width: 44px !important;
-        min-height: 44px !important;
-        border-radius: 10px !important;
-        font-size: 1.15rem !important;
-        font-weight: 700 !important;
-        padding: 0 !important;
-        box-shadow: 0 4px 18px rgba(56,139,253,0.4) !important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
+# Sidebar (Streamlit built-in — always visible on load)
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    # Collapse control — visible only when expanded
-    if not st.session_state.sidebar_collapsed:
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            if st.button("≪", key="collapse_sidebar", help="Collapse sidebar"):
-                st.session_state.sidebar_collapsed = True
-                st.rerun()
-        st.markdown("""
-        <style>
-        div.st-key-collapse_sidebar button {
-            width: 40px !important;
-            min-height: 36px !important;
-            border-radius: 8px !important;
-            font-weight: 700 !important;
-            padding: 0 !important;
-            background: #21262d !important;
-            border: 1px solid #30363d !important;
-            color: #c9d1d9 !important;
-        }
-        div.st-key-collapse_sidebar button:hover {
-            border-color: #58a6ff !important;
-            color: #58a6ff !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
     st.markdown("""
     <div style="padding: 0.5rem 0 1.2rem 0;">
         <div style="font-size: 1.3rem; font-weight: 700; color: #f0f6fc; letter-spacing: -0.02em;">◈ Kronecker Lab</div>
@@ -587,14 +461,12 @@ with st.sidebar:
         st.session_state.uploaded_image_size = None
 
     if st.session_state.uploaded_image_bytes is None:
-    # Empty state → show uploader in sidebar
-        with st.sidebar:
-            st.markdown("### 📷 Upload Image")
-
-            uploaded = st.file_uploader(
-                "Upload PNG / JPG",
-                 type=["png", "jpg", "jpeg"],
-                 key=f"uploader_{st.session_state.upload_key}",
+        # Empty state → show uploader with unique key so it fully resets after clear
+        uploaded = st.file_uploader(
+            "Upload PNG / JPG",
+            type=["png", "jpg", "jpeg"],
+            label_visibility="collapsed",
+            key=f"uploader_{st.session_state.upload_key}",
         )
         if uploaded is not None:
             st.session_state.uploaded_image_bytes = uploaded.getvalue()
