@@ -167,8 +167,17 @@ class VisionTransformer(nn.Module):
         """
         Utility used by the Streamlit app and visualisations:
         return the raw patch embeddings *before* the class token / pos-emb.
+        Shape: (B, num_patches, embed_dim)
         """
         return self.patch_embed.patch_embed(x)
+
+    def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Return the [CLS] token embedding immediately before the classification head.
+        Shape: (B, embed_dim)
+        """
+        cls_token, _ = self.forward_features(x, return_attention=False)
+        return cls_token
 
 
 # ---------------------------------------------------------------------------

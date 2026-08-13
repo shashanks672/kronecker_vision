@@ -92,6 +92,33 @@ class BaselineCNN(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract the penultimate embedding (after fc1 + ReLU, before dropout/classifier).
+
+        Parameters
+        ----------
+        x : (B, 3, 32, 32)
+
+        Returns
+        -------
+        embedding : (B, fc_hidden)  — default 256-dim
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x, inplace=True)
+        x = self.pool1(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.relu(x, inplace=True)
+        x = self.pool2(x)
+
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x, inplace=True)
+        return x
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -102,25 +129,14 @@ class BaselineCNN(nn.Module):
         -------
         logits : Tensor of shape (B, num_classes)
         """
-        # Block 1
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = F.relu(x, inplace=True)
-        x = self.pool1(x)
-
-        # Block 2
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = F.relu(x, inplace=True)
-        x = self.pool2(x)
-
-        # Classifier
-        x = torch.flatten(x, 1)
-        x = self.fc1(x)
-        x = F.relu(x, inplace=True)
-        x = self.dropout(x)
+        features = self.forward_features(x)
+        x = self.dropout(features)
         x = self.fc2(x)
         return x
+
+    def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """Alias for forward_features — used by Embedding Analysis UI."""
+        return self.forward_features(x)
 
     def count_parameters(self) -> int:
         """Return total number of trainable parameters."""
