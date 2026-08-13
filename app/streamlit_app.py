@@ -587,12 +587,14 @@ with st.sidebar:
         st.session_state.uploaded_image_size = None
 
     if st.session_state.uploaded_image_bytes is None:
-        # Empty state → show uploader with unique key so it fully resets after clear
-        uploaded = st.file_uploader(
-            "Upload PNG / JPG",
-            type=["png", "jpg", "jpeg"],
-            label_visibility="collapsed",
-            key=f"uploader_{st.session_state.upload_key}",
+    # Empty state → show uploader in sidebar
+        with st.sidebar:
+            st.markdown("### 📷 Upload Image")
+
+            uploaded = st.file_uploader(
+                "Upload PNG / JPG",
+                 type=["png", "jpg", "jpeg"],
+                 key=f"uploader_{st.session_state.upload_key}",
         )
         if uploaded is not None:
             st.session_state.uploaded_image_bytes = uploaded.getvalue()
