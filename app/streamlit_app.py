@@ -8,10 +8,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from io import BytesIO
+
 import streamlit as st
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
 from PIL import Image
@@ -37,6 +40,20 @@ sys.path.insert(0, str(ROOT))
 from datasets.cifar import get_class_names
 from models.vit import ViTConfig, build_vit, build_kvit
 from models.cnn import BaselineCNN, CNNConfig
+
+# Embedding analysis helpers (live next to this file)
+sys.path.insert(0, str(ROOT / "app"))
+from embedding_analysis import (
+    extract_cnn_embedding,
+    extract_vit_embedding,
+    compute_stats,
+    plot_embedding_bar,
+    plot_embedding_heatmap,
+    plot_histogram,
+    plot_pca_patches,
+    plot_tsne_patches,
+    format_raw_values,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,6 +340,43 @@ def load_model(model_name: str, weights_path: str, device_str: str):
     return model, device, weights_exist
 
 
+@st.cache_resource
+def load_all_models(device_str: str):
+    """Load CNN, ViT, and Kronecker-ViT for side-by-side embedding comparison."""
+    cfg = load_config()
+    device = torch.device(device_str)
+    weights = {
+        "CNN": ROOT / "weights" / "cnn_best.pt",
+        "ViT": ROOT / "weights" / "vit_best.pt",
+        "KViT": ROOT / "weights" / "kvit_best.pt",
+    }
+    models = {}
+    loaded_flags = {}
+    for name, path in weights.items():
+        if name == "CNN":
+            m = BaselineCNN(CNNConfig(num_classes=10))
+        else:
+            vit_cfg = ViTConfig(
+                img_size=32,
+                patch_size=4,
+                embed_dim=cfg["model"]["embed_dim"],
+                depth=cfg["model"]["depth"],
+                num_heads=cfg["model"]["num_heads"],
+                local_feat_dim=cfg["kronecker"]["local_feat_dim"],
+                pos_dim=cfg["kronecker"]["pos_dim"],
+                num_local_features=cfg["kronecker"]["num_local_features"],
+            )
+            m = build_vit(vit_cfg) if name == "ViT" else build_kvit(vit_cfg)
+        ok = path.exists()
+        if ok:
+            ckpt = torch.load(path, map_location=device)
+            m.load_state_dict(ckpt["model_state_dict"])
+        m = m.to(device).eval()
+        models[name] = m
+        loaded_flags[name] = ok
+    return models, device, loaded_flags
+
+
 def preprocess_image(img: Image.Image, mean, std) -> torch.Tensor:
     img = img.convert("RGB").resize((32, 32), Image.BILINEAR)
     arr = np.asarray(img).astype(np.float32) / 255.0
@@ -348,10 +402,136 @@ def entropy(probs: np.ndarray) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sidebar collapse state
+# ─────────────────────────────────────────────────────────────────────────────
+
+if "sidebar_collapsed" not in st.session_state:
+    st.session_state.sidebar_collapsed = False
+
+# CSS: collapsed rail (~60px) + fixed expand button that always stays visible
+if st.session_state.sidebar_collapsed:
+    st.markdown("""
+    <style>
+    /* Narrow the Streamlit sidebar to a thin rail */
+    section[data-testid="stSidebar"] {
+        min-width: 60px !important;
+        max-width: 60px !important;
+        width: 60px !important;
+        overflow: hidden !important;
+    }
+    section[data-testid="stSidebar"] > div {
+        width: 60px !important;
+        padding: 0 !important;
+    }
+    /* Hide all normal sidebar content while collapsed */
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] > div {
+        opacity: 0 !important;
+        pointer-events: none !important;
+        height: 0 !important;
+        overflow: hidden !important;
+    }
+    /* Hide Streamlit's built-in collapse control (we use our own) */
+    button[kind="header"],
+    [data-testid="collapsedControl"] {
+        display: none !important;
+    }
+    /* Fixed expand (>>) button — always on top at left edge */
+    div.st-key-expand_sidebar,
+    div[data-testid="stButton"]:has(button[aria-label="Expand sidebar"]),
+    .kv-expand-wrap {
+        position: fixed !important;
+        left: 8px !important;
+        top: 80px !important;
+        z-index: 2147483647 !important;
+        width: 44px !important;
+    }
+    div.st-key-expand_sidebar button,
+    .kv-expand-wrap button {
+        width: 44px !important;
+        height: 44px !important;
+        border-radius: 10px !important;
+        background: linear-gradient(145deg, #1f6feb, #388bfd) !important;
+        color: #fff !important;
+        border: 1px solid rgba(88,166,255,0.5) !important;
+        font-size: 1.1rem !important;
+        font-weight: 700 !important;
+        box-shadow: 0 4px 18px rgba(56,139,253,0.35) !important;
+        padding: 0 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <style>
+    /* Ensure built-in control doesn't fight our custom toggle when expanded */
+    [data-testid="collapsedControl"] {
+        display: none !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Floating expand button (main area) — only when collapsed; always visible via fixed CSS
+if st.session_state.sidebar_collapsed:
+    # Marker + button; CSS targets .st-key-expand_sidebar (Streamlit ≥1.33) and sibling patterns
+    exp_col = st.container()
+    with exp_col:
+        if st.button("≫", key="expand_sidebar", help="Expand sidebar", type="primary"):
+            st.session_state.sidebar_collapsed = False
+            st.rerun()
+    st.markdown("""
+    <style>
+    /* Stronger fixed positioning for the expand control */
+    div.st-key-expand_sidebar {
+        position: fixed !important;
+        left: 8px !important;
+        top: 80px !important;
+        z-index: 2147483647 !important;
+        width: 44px !important;
+        margin: 0 !important;
+    }
+    div.st-key-expand_sidebar button {
+        width: 44px !important;
+        min-height: 44px !important;
+        border-radius: 10px !important;
+        font-size: 1.15rem !important;
+        font-weight: 700 !important;
+        padding: 0 !important;
+        box-shadow: 0 4px 18px rgba(56,139,253,0.4) !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    # Collapse control — visible only when expanded
+    if not st.session_state.sidebar_collapsed:
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            if st.button("≪", key="collapse_sidebar", help="Collapse sidebar"):
+                st.session_state.sidebar_collapsed = True
+                st.rerun()
+        st.markdown("""
+        <style>
+        div.st-key-collapse_sidebar button {
+            width: 40px !important;
+            min-height: 36px !important;
+            border-radius: 8px !important;
+            font-weight: 700 !important;
+            padding: 0 !important;
+            background: #21262d !important;
+            border: 1px solid #30363d !important;
+            color: #c9d1d9 !important;
+        }
+        div.st-key-collapse_sidebar button:hover {
+            border-color: #58a6ff !important;
+            color: #58a6ff !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
     st.markdown("""
     <div style="padding: 0.5rem 0 1.2rem 0;">
         <div style="font-size: 1.3rem; font-weight: 700; color: #f0f6fc; letter-spacing: -0.02em;">◈ Kronecker Lab</div>
@@ -390,8 +570,55 @@ with st.sidebar:
     st.markdown(f'<div style="font-size:0.75rem;color:#8b949e;margin-top:0.5rem;">Device: <code>{device}</code></div>', unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown('<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.5rem;">Input Image</div>', unsafe_allow_html=True)
-    uploaded = st.file_uploader("Upload PNG / JPG", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
+    st.markdown(
+        '<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;'
+        'letter-spacing:0.06em;margin-bottom:0.5rem;">Input Image</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Session-state image store (survives tab navigation) ─────────────────
+    if "upload_key" not in st.session_state:
+        st.session_state.upload_key = 0
+    if "uploaded_image_bytes" not in st.session_state:
+        st.session_state.uploaded_image_bytes = None
+    if "uploaded_image_name" not in st.session_state:
+        st.session_state.uploaded_image_name = None
+    if "uploaded_image_size" not in st.session_state:
+        st.session_state.uploaded_image_size = None
+
+    if st.session_state.uploaded_image_bytes is None:
+        # Empty state → show uploader with unique key so it fully resets after clear
+        uploaded = st.file_uploader(
+            "Upload PNG / JPG",
+            type=["png", "jpg", "jpeg"],
+            label_visibility="collapsed",
+            key=f"uploader_{st.session_state.upload_key}",
+        )
+        if uploaded is not None:
+            st.session_state.uploaded_image_bytes = uploaded.getvalue()
+            st.session_state.uploaded_image_name = uploaded.name
+            st.session_state.uploaded_image_size = len(st.session_state.uploaded_image_bytes)
+            st.rerun()
+    else:
+        # Filled state → thumbnail + caption + Change Image
+        try:
+            thumb = Image.open(BytesIO(st.session_state.uploaded_image_bytes)).convert("RGB")
+            thumb.thumbnail((180, 180))
+            st.image(thumb, use_container_width=True)
+        except Exception:
+            st.warning("Could not preview image.")
+
+        name = st.session_state.uploaded_image_name or "image"
+        size_b = st.session_state.uploaded_image_size or 0
+        size_str = f"{size_b / 1024:.1f} KB" if size_b < 1024 * 1024 else f"{size_b / (1024 * 1024):.2f} MB"
+        st.caption(f"{name}  ·  {size_str}")
+
+        if st.button("Change Image", use_container_width=True, key="btn_change_image"):
+            st.session_state.uploaded_image_bytes = None
+            st.session_state.uploaded_image_name = None
+            st.session_state.uploaded_image_size = None
+            st.session_state.upload_key += 1  # forces a brand-new uploader widget
+            st.rerun()
 
     st.markdown("---")
     with st.expander("About KPE", expanded=False):
@@ -432,14 +659,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Image handling
-if uploaded is not None:
-    pil_img = Image.open(uploaded)
+# Image handling (from session_state — survives tab changes)
+if st.session_state.uploaded_image_bytes is not None:
+    try:
+        pil_img = Image.open(BytesIO(st.session_state.uploaded_image_bytes)).convert("RGB")
+    except Exception:
+        st.warning("Failed to load the stored image — using a random sample.")
+        arr = (np.random.rand(32, 32, 3) * 255).astype(np.uint8)
+        pil_img = Image.fromarray(arr)
 else:
     st.markdown("""
     <div class="kv-explain">
         <strong>No image uploaded.</strong> A random noise sample is shown below.
-        Upload any image — it will be resized to 32×32 and processed by the selected model.
+        Upload any image in the sidebar — it will be resized to 32×32 and processed by the selected model.
     </div>
     """, unsafe_allow_html=True)
     arr = (np.random.rand(32, 32, 3) * 255).astype(np.uint8)
@@ -569,163 +801,481 @@ plt.close(fig)
 # ── Kronecker Embeddings ────────────────────────────────────────────────────
 
 if model_key == "KViT":
-    st.markdown('<div class="kv-section">Kronecker Patch Embeddings <span>CORE CONTRIBUTION</span></div>', unsafe_allow_html=True)
+    with st.expander("Advanced Analysis · Kronecker Patch Matrix & Cosine Similarity", expanded=False):
+        st.markdown("""
+        <div class="kv-explain">
+            Actual output of the proposed <strong>Kronecker Patch Embedding</strong> layer.
+            Rows = patches, columns = dims. Formed by Σ (eᵢ ⊗ pᵢ) inside every patch.
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.markdown("""
-    <div class="kv-explain">
-        Below is the actual output of the proposed <strong>Kronecker Patch Embedding</strong> layer.
-        Each of the 64 rows is one patch; each of the 128 columns is one dimension of the embedding.
-        These embeddings are formed by summing Kronecker products of local features and position vectors
-        <em>inside</em> every patch — not by a simple linear projection.
-    </div>
-    """, unsafe_allow_html=True)
+        with torch.no_grad():
+            patch_emb = model.get_patch_embeddings(img_tensor)
+            emb_np = patch_emb.squeeze(0).cpu().numpy()
 
-    with torch.no_grad():
-        patch_emb = model.get_patch_embeddings(img_tensor)  # (1, 64, 128)
-        emb_np = patch_emb.squeeze(0).cpu().numpy()
+        emb_mean = float(emb_np.mean())
+        emb_std = float(emb_np.std())
+        emb_norm = float(np.linalg.norm(emb_np, axis=1).mean())
 
-    # Stats
-    emb_mean = float(emb_np.mean())
-    emb_std = float(emb_np.std())
-    emb_norm = float(np.linalg.norm(emb_np, axis=1).mean())
+        stat_cols = st.columns(4)
+        for col, (label, val) in zip(stat_cols, [
+            ("Shape", "64 × 128"),
+            ("Mean", f"{emb_mean:.4f}"),
+            ("Std", f"{emb_std:.4f}"),
+            ("Avg L2", f"{emb_norm:.3f}"),
+        ]):
+            with col:
+                st.markdown(
+                    f'<div class="kv-chip"><div class="kv-chip-label">{label}</div>'
+                    f'<div class="kv-chip-val">{val}</div></div>',
+                    unsafe_allow_html=True,
+                )
 
-    stat_cols = st.columns(4)
-    stats = [
-        ("Shape", "64 × 128"),
-        ("Mean", f"{emb_mean:.4f}"),
-        ("Std", f"{emb_std:.4f}"),
-        ("Avg L2 Norm", f"{emb_norm:.3f}"),
-    ]
-    for col, (label, val) in zip(stat_cols, stats):
-        with col:
-            st.markdown(
-                f"""
-                <div class="kv-chip">
-                    <div class="kv-chip-label">{label}</div>
-                    <div class="kv-chip-val">{val}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+        fig, ax = plt.subplots(figsize=(10, 3.2))
+        im = ax.imshow(emb_np, aspect="auto", cmap="magma", interpolation="nearest")
+        ax.set_xlabel("Dimension", fontsize=8)
+        ax.set_ylabel("Patch", fontsize=8)
+        ax.set_title("Kronecker Patch Embedding Matrix", fontsize=10, color="#f0f6fc", pad=6)
+        fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(12, 4.2))
-    im = ax.imshow(emb_np, aspect="auto", cmap="magma", interpolation="nearest")
-    ax.set_xlabel("Embedding dimension (0 → 127)", fontsize=10)
-    ax.set_ylabel("Patch index (0 → 63)", fontsize=10)
-    ax.set_title("Kronecker Patch Embedding Matrix", fontsize=12, color="#f0f6fc", pad=10)
-    cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-    cbar.ax.yaxis.set_tick_params(color="#8b949e")
-    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="#8b949e")
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-    st.markdown("""
-    <div class="kv-explain">
-        <strong>Interpretation:</strong> Bright vertical bands indicate dimensions that are consistently
-        activated across many patches (shared structure). Horizontal variation shows how different
-        spatial regions of the image produce distinct embedding signatures. Because of the Kronecker
-        composition, these patterns are constrained to be factorisable into content × position.
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Cosine similarity
-    st.markdown('<div class="kv-card-title" style="margin-top:1.2rem;">Pairwise Cosine Similarity of Patch Embeddings</div>', unsafe_allow_html=True)
-
-    from sklearn.metrics.pairwise import cosine_similarity
-    sim = cosine_similarity(emb_np)
-
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    im = ax.imshow(sim, cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest")
-    ax.set_title("Cosine Similarity (64 × 64)", fontsize=11, color="#f0f6fc", pad=8)
-    ax.set_xlabel("Patch index")
-    ax.set_ylabel("Patch index")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.yaxis.set_tick_params(color="#8b949e")
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=False)
-    plt.close(fig)
-
-    st.markdown("""
-    <div class="kv-explain">
-        <strong>What this shows:</strong> Diagonal is always 1 (a patch is identical to itself).
-        Bright off-diagonal blocks reveal groups of patches that the embedding has made similar —
-        often corresponding to spatially adjacent or semantically related regions (e.g. sky patches,
-        object body patches). Dark regions indicate dissimilar patches. This matrix is a direct
-        view of the geometry induced by the Kronecker composition.
-    </div>
-    """, unsafe_allow_html=True)
+        from sklearn.metrics.pairwise import cosine_similarity
+        sim = cosine_similarity(emb_np)
+        fig, ax = plt.subplots(figsize=(5.2, 4.2))
+        im = ax.imshow(sim, cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest")
+        ax.set_title("Cosine Similarity (64 × 64)", fontsize=10, color="#f0f6fc", pad=6)
+        ax.set_xlabel("Patch")
+        ax.set_ylabel("Patch")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=False)
+        plt.close(fig)
 
 # ── Attention ───────────────────────────────────────────────────────────────
 
 if attn_maps is not None:
-    st.markdown('<div class="kv-section">Transformer Attention <span>STEP 3</span></div>', unsafe_allow_html=True)
+    with st.expander("Advanced Analysis · Transformer Attention (CLS → patches)", expanded=False):
+        st.markdown("""
+        <div class="kv-explain">
+            After the patch embeddings are formed, Transformer blocks let every token attend to
+            every other token. Maps show how much the <strong>[CLS] token</strong> attends to
+            each of the 64 spatial patches. Brighter = higher attention.
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.markdown("""
-    <div class="kv-explain">
-        After the patch embeddings are formed, a stack of Transformer blocks lets every token
-        attend to every other token. The maps below show how much the <strong>[CLS] token</strong>
-        (used for classification) attends to each of the 64 spatial patches. Brighter = higher attention.
-    </div>
-    """, unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            layer_idx = st.slider("Layer", 0, len(attn_maps) - 1, len(attn_maps) - 1,
+                                  help="Deeper layers usually show more semantic focus.")
+            head_idx = st.slider("Attention Head", 0, attn_maps[0].shape[1] - 1, 0)
 
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        layer_idx = st.slider("Layer", 0, len(attn_maps) - 1, len(attn_maps) - 1,
-                              help="Deeper layers usually show more semantic focus.")
-        head_idx = st.slider("Attention Head", 0, attn_maps[0].shape[1] - 1, 0)
+        attn = attn_maps[layer_idx][0, head_idx].cpu().numpy()
+        cls_attn = attn[0, 1:]
+        n = int(np.sqrt(len(cls_attn)))
+        grid = cls_attn.reshape(n, n)
 
-    attn = attn_maps[layer_idx][0, head_idx].cpu().numpy()
-    cls_attn = attn[0, 1:]  # CLS → patches
-    n = int(np.sqrt(len(cls_attn)))
-    grid = cls_attn.reshape(n, n)
+        fig, ax = plt.subplots(figsize=(4.5, 3.6))
+        im = ax.imshow(grid, cmap="inferno", interpolation="nearest")
+        ax.set_title(f"CLS Attention  ·  Layer {layer_idx}  ·  Head {head_idx}",
+                     fontsize=10, color="#f0f6fc", pad=6)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.yaxis.set_tick_params(color="#8b949e")
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=False)
+        plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(5, 4.2))
-    im = ax.imshow(grid, cmap="inferno", interpolation="nearest")
-    ax.set_title(f"CLS Attention  ·  Layer {layer_idx}  ·  Head {head_idx}",
-                 fontsize=11, color="#f0f6fc", pad=8)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.yaxis.set_tick_params(color="#8b949e")
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=False)
+        st.caption("Early layers ≈ local / uniform · Late layers ≈ semantic focus · Heads specialise")
+
+# ── Embedding Analysis (compact research dashboard) ─────────────────────────
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1rem; padding-bottom: 1.5rem; max-width: 1480px;}
+.ea-hero {
+    background: linear-gradient(135deg, rgba(56,139,253,0.10) 0%, rgba(163,113,247,0.08) 100%);
+    border: 1px solid #21262d;
+    border-radius: 14px;
+    padding: 0.9rem 1.2rem;
+    margin: 0.2rem 0 0.9rem 0;
+}
+.ea-hero h2 {
+    margin: 0 0 0.2rem 0;
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #f0f6fc;
+    letter-spacing: -0.02em;
+}
+.ea-hero p {
+    margin: 0;
+    color: #8b949e;
+    font-size: 0.82rem;
+    line-height: 1.4;
+}
+.ea-metric {
+    background: linear-gradient(160deg, rgba(22,27,34,0.95), rgba(13,17,23,0.98));
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 0.75rem 0.85rem;
+    transition: transform 0.15s ease, border-color 0.15s ease;
+    height: 100%;
+}
+.ea-metric:hover {
+    transform: translateY(-1px);
+    border-color: #58a6ff;
+}
+.ea-metric .label {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #8b949e;
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+}
+.ea-metric .value {
+    font-size: 1.2rem;
+    font-weight: 700;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    color: #f0f6fc;
+    line-height: 1.1;
+}
+.ea-metric .icon {
+    font-size: 0.85rem;
+    margin-bottom: 0.2rem;
+    opacity: 0.9;
+}
+.ea-panel {
+    background: linear-gradient(160deg, rgba(22,27,34,0.92), rgba(13,17,23,0.96));
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 0.7rem 0.8rem 0.85rem 0.8rem;
+    margin-bottom: 0.65rem;
+    height: 100%;
+}
+.ea-panel-title {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #8b949e;
+    margin-bottom: 0.45rem;
+}
+.ea-panel-sub {
+    font-size: 0.68rem;
+    color: #6e7681;
+    margin: -0.25rem 0 0.4rem 0;
+}
+.ea-strip {
+    height: 8px;
+    border-radius: 5px;
+    background: linear-gradient(90deg, #f85149 0%, #8b949e 50%, #3fb950 100%);
+    margin: 0.45rem 0 0.15rem 0;
+}
+.ea-strip-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.65rem;
+    color: #8b949e;
+    font-family: 'JetBrains Mono', monospace;
+}
+.ea-stats-box {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    color: #c9d1d9;
+    line-height: 1.65;
+}
+.ea-stats-box span.label { color: #8b949e; display: inline-block; width: 7.2rem; }
+.ea-stats-box span.val { color: #f0f6fc; font-weight: 500; }
+div[data-testid="stDataFrame"] {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #30363d;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="kv-section">Embedding Analysis <span>LAB</span></div>', unsafe_allow_html=True)
+
+# Extract embedding for the currently selected model (UNCHANGED LOGIC)
+with torch.no_grad():
+    if model_key == "CNN":
+        primary_result = extract_cnn_embedding(model, img_tensor)
+    elif model_key == "ViT":
+        primary_result = extract_vit_embedding(model, img_tensor, name="ViT")
+    else:
+        primary_result = extract_vit_embedding(model, img_tensor, name="Kronecker-ViT")
+
+primary_stats = compute_stats(primary_result.embedding)
+
+# Hero
+st.markdown(f"""
+<div class="ea-hero">
+    <h2>{primary_result.model_name} Embedding</h2>
+    <p>{primary_result.source}</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Six metric cards ────────────────────────────────────────────────────────
+mcols = st.columns(6)
+_metric_specs = [
+    (mcols[0], "#", "Dimension", f"{primary_stats['dim']}"),
+    (mcols[1], "μ", "Mean", f"{primary_stats['mean']:.4f}"),
+    (mcols[2], "σ", "Std Dev", f"{primary_stats['std']:.4f}"),
+    (mcols[3], "‖·‖", "L2 Norm", f"{primary_stats['l2_norm']:.3f}"),
+    (mcols[4], "↓", "Minimum", f"{primary_stats['min']:.3f}"),
+    (mcols[5], "↑", "Maximum", f"{primary_stats['max']:.3f}"),
+]
+for col, icon, label, val in _metric_specs:
+    with col:
+        st.markdown(f"""
+        <div class="ea-metric">
+            <div class="icon">{icon}</div>
+            <div class="label">{label}</div>
+            <div class="value">{val}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+st.markdown("<div style='height:0.55rem'></div>", unsafe_allow_html=True)
+
+# ── Raw embedding table (column-wise) ───────────────────────────────────────
+st.markdown("""
+<div class="ea-panel" style="margin-bottom:0.7rem;">
+<div class="ea-panel-title">Raw Embedding Values (Column-wise)</div>
+<div class="ea-panel-sub">Each column is one dimension of the embedding vector</div>
+</div>
+""", unsafe_allow_html=True)
+
+max_dim = int(primary_stats["dim"])
+choices = [n for n in (16, 32, 64, 128, 256) if n <= max_dim]
+if max_dim not in choices:
+    choices.append(max_dim)
+default_idx = 1 if 32 in choices else 0
+
+ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 4])
+with ctrl1:
+    n_show = st.selectbox("Show", options=choices, index=default_idx, key="ea_n_dims", label_visibility="collapsed")
+with ctrl2:
+    st.caption(f"Showing {n_show} of {max_dim} dims")
+with ctrl3:
+    full_df = pd.DataFrame({
+        "dimension": list(range(max_dim)),
+        "value": primary_result.embedding.astype(float),
+    })
+    st.download_button(
+        label="⬇ Download CSV",
+        data=full_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{primary_result.model_name.lower().replace(' ', '_')}_embedding.csv",
+        mime="text/csv",
+    )
+
+row_df = pd.DataFrame(
+    [primary_result.embedding[:n_show].astype(float)],
+    columns=[f"Dim {i}" for i in range(n_show)],
+    index=["Value"],
+)
+vmax = float(abs(primary_result.embedding[:n_show]).max()) or 1.0
+st.dataframe(
+    row_df.style.format("{:+.4f}").background_gradient(
+        cmap="RdYlGn", axis=1, vmin=-vmax, vmax=vmax,
+    ),
+    use_container_width=True,
+    height=78,
+)
+
+st.markdown("""
+<div class="ea-strip"></div>
+<div class="ea-strip-labels"><span>negative</span><span>0</span><span>positive</span></div>
+""", unsafe_allow_html=True)
+
+st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+# ── Visualization grid: row 1 (4 panels) ────────────────────────────────────
+r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+
+with r1c1:
+    st.markdown('<div class="ea-panel"><div class="ea-panel-title">Embedding Bar Chart</div><div class="ea-panel-sub">First N dimensions</div></div>', unsafe_allow_html=True)
+    fig = plot_embedding_bar(
+        primary_result.embedding, n_show=n_show,
+        title="", figsize=(3.8, 2.4),
+    )
+    st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
-    st.markdown("""
-    <div class="kv-explain">
-        <strong>How to read attention maps:</strong><br>
-        • Early layers tend to attend more uniformly or to local neighbourhoods.<br>
-        • Later layers often focus on the most discriminative object parts.<br>
-        • Different heads can specialise (one head on texture, another on shape boundaries).<br>
-        • The [CLS] token aggregates information; high attention weight means that patch strongly
-          influenced the final classification decision.
+with r1c2:
+    st.markdown('<div class="ea-panel"><div class="ea-panel-title">Embedding Heatmap</div><div class="ea-panel-sub">Full vector</div></div>', unsafe_allow_html=True)
+    fig = plot_embedding_heatmap(
+        primary_result.embedding.reshape(1, -1),
+        title="", figsize=(3.8, 2.4),
+    )
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+with r1c3:
+    st.markdown('<div class="ea-panel"><div class="ea-panel-title">Distribution (Histogram)</div><div class="ea-panel-sub">Value distribution</div></div>', unsafe_allow_html=True)
+    fig = plot_histogram(primary_result.embedding, title="", figsize=(3.8, 2.4), bins=40)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+with r1c4:
+    st.markdown('<div class="ea-panel"><div class="ea-panel-title">Embedding Statistics</div><div class="ea-panel-sub">Summary of values</div></div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="ea-panel" style="margin-top:-0.4rem;">
+    <div class="ea-stats-box">
+        <div><span class="label">Mean</span><span class="val">{primary_stats['mean']:+.4f}</span></div>
+        <div><span class="label">Std Deviation</span><span class="val">{primary_stats['std']:.4f}</span></div>
+        <div><span class="label">Variance</span><span class="val">{primary_stats['std']**2:.4f}</span></div>
+        <div><span class="label">Min Value</span><span class="val">{primary_stats['min']:+.4f}</span></div>
+        <div><span class="label">Max Value</span><span class="val">{primary_stats['max']:+.4f}</span></div>
+        <div><span class="label">Sparsity</span><span class="val">{primary_stats['sparsity']*100:.2f}%</span></div>
+        <div><span class="label">L1 Norm</span><span class="val">{primary_stats['l1_norm']:.4f}</span></div>
+        <div><span class="label">L2 Norm</span><span class="val">{primary_stats['l2_norm']:.4f}</span></div>
+    </div>
     </div>
     """, unsafe_allow_html=True)
+
+# ── Visualization grid: row 2 (PCA / t-SNE / Patch matrix) ──────────────────
+r2c1, r2c2, r2c3 = st.columns(3)
+
+with r2c1:
+    st.markdown('<div class="ea-panel"><div class="ea-panel-title">PCA Projection (2D)</div></div>', unsafe_allow_html=True)
+    if primary_result.patch_matrix is not None:
+        fig = plot_pca_patches(primary_result.patch_matrix, title="", figsize=(4.2, 2.8))
+        if fig is not None:
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+    else:
+        st.caption("PCA available for ViT / Kronecker-ViT only")
+
+with r2c2:
+    st.markdown('<div class="ea-panel"><div class="ea-panel-title">t-SNE Projection (2D)</div></div>', unsafe_allow_html=True)
+    if primary_result.patch_matrix is not None:
+        with st.spinner("t-SNE…"):
+            fig = plot_tsne_patches(primary_result.patch_matrix, title="", figsize=(4.2, 2.8))
+        if fig is not None:
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+        else:
+            st.caption("t-SNE unavailable")
+    else:
+        st.caption("t-SNE available for ViT / Kronecker-ViT only")
+
+with r2c3:
+    st.markdown('<div class="ea-panel"><div class="ea-panel-title">Patch Embedding Matrix</div><div class="ea-panel-sub">Before CLS aggregation</div></div>', unsafe_allow_html=True)
+    if primary_result.patch_matrix is not None:
+        fig = plot_embedding_heatmap(
+            primary_result.patch_matrix,
+            title="",
+            figsize=(4.5, 2.8),
+        )
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+    else:
+        st.caption("Patch matrix available for ViT / Kronecker-ViT only")
+
+# ── Model Comparison ────────────────────────────────────────────────────────
+st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
+st.markdown('<div class="ea-panel-title" style="margin-bottom:0.4rem;">Model Comparison (Same Input Image)</div>', unsafe_allow_html=True)
+
+all_models, cmp_device, flags = load_all_models(device_str)
+img_cmp = img_tensor.to(cmp_device)
+
+results = {}
+with torch.no_grad():
+    results["CNN"] = extract_cnn_embedding(all_models["CNN"], img_cmp)
+    results["ViT"] = extract_vit_embedding(all_models["ViT"], img_cmp, name="ViT")
+    results["Kronecker-ViT"] = extract_vit_embedding(
+        all_models["KViT"], img_cmp, name="Kronecker-ViT"
+    )
+
+cmp_rows = []
+best_conf = -1.0
+best_name = None
+for name, res in results.items():
+    s = compute_stats(res.embedding)
+    pred_name = class_names[res.pred_idx] if res.pred_idx is not None else "—"
+    conf = float(res.confidence) if res.confidence is not None else 0.0
+    key = "KViT" if name == "Kronecker-ViT" else name
+    loaded = "●" if flags.get(key, False) else "○"
+    if conf > best_conf:
+        best_conf = conf
+        best_name = name
+    cmp_rows.append({
+        "Model": f"{loaded} {name}",
+        "Embedding Dim": s["dim"],
+        "Mean": round(s["mean"], 4),
+        "Std": round(s["std"], 4),
+        "Min": round(s["min"], 3),
+        "Max": round(s["max"], 3),
+        "L2 Norm": round(s["l2_norm"], 3),
+        "Prediction": pred_name,
+        "Confidence": f"{conf * 100:.1f}%",
+    })
+
+cmp_df = pd.DataFrame(cmp_rows)
+
+def _highlight_best(row):
+    if best_name and best_name in str(row["Model"]):
+        return ["background-color: rgba(63,185,80,0.14)"] * len(row)
+    return [""] * len(row)
+
+st.dataframe(
+    cmp_df.style.apply(_highlight_best, axis=1),
+    use_container_width=True,
+    hide_index=True,
+)
+st.caption("● trained weights loaded  ·  ○ random init  ·  green row = highest confidence")
+
+# Overlay histogram (compact)
+with st.expander("Distribution overlay across models", expanded=False):
+    fig, ax = plt.subplots(figsize=(9, 2.6))
+    colors = {"CNN": "#f85149", "ViT": "#388bfd", "Kronecker-ViT": "#a371f7"}
+    for name, res in results.items():
+        ax.hist(
+            res.embedding, bins=40, alpha=0.45, label=name,
+            color=colors.get(name, "#8b949e"), density=True,
+        )
+    ax.set_xlabel("Embedding value", fontsize=8)
+    ax.set_ylabel("Density", fontsize=8)
+    ax.legend(fontsize=7)
+    ax.tick_params(labelsize=7)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+st.markdown("""
+<div class="kv-explain" style="margin-top:0.5rem;">
+    <strong>Why these embeddings differ</strong> —
+    <strong>CNN</strong>: 256-d global conv features ·
+    <strong>ViT</strong>: linear patch proj + CLS ·
+    <strong>Kronecker-ViT</strong>: Σ (content ⊗ position) per patch, then same Transformer
+</div>
+""", unsafe_allow_html=True)
 
 # ── Architecture reminder ───────────────────────────────────────────────────
 
-st.markdown('<div class="kv-section">Architecture Overview</div>', unsafe_allow_html=True)
-
-st.markdown("""
-<div class="kv-card">
-<div style="font-family:'JetBrains Mono',monospace; font-size:0.82rem; color:#8b949e; line-height:1.7;">
-<span style="color:#58a6ff;">Image</span> (3×32×32)<br>
-&nbsp;&nbsp;│<br>
-&nbsp;&nbsp;▼<br>
-<span style="color:#a371f7;">Kronecker Patch Embedding</span> &nbsp;→&nbsp; 64 tokens × 128 dims<br>
-&nbsp;&nbsp;│ &nbsp;&nbsp;<span style="color:#484f58;">E = Σ (eᵢ ⊗ pᵢ)</span><br>
-&nbsp;&nbsp;▼<br>
-+ [CLS] token + Absolute Positional Embedding<br>
-&nbsp;&nbsp;│<br>
-&nbsp;&nbsp;▼<br>
-<span style="color:#58a6ff;">Transformer Encoder × 6</span> &nbsp;(4 heads, MLP ratio 4)<br>
-&nbsp;&nbsp;│<br>
-&nbsp;&nbsp;▼<br>
-[CLS] → Linear head → 10-class logits
-</div>
-</div>
-""", unsafe_allow_html=True)
+with st.expander("Architecture Overview", expanded=False):
+    st.markdown("""
+    <div style="font-family:'JetBrains Mono',monospace; font-size:0.82rem; color:#8b949e; line-height:1.7;">
+    <span style="color:#58a6ff;">Image</span> (3×32×32)<br>
+    &nbsp;&nbsp;│<br>
+    &nbsp;&nbsp;▼<br>
+    <span style="color:#a371f7;">Kronecker Patch Embedding</span> &nbsp;→&nbsp; 64 tokens × 128 dims<br>
+    &nbsp;&nbsp;│ &nbsp;&nbsp;<span style="color:#484f58;">E = Σ (eᵢ ⊗ pᵢ)</span><br>
+    &nbsp;&nbsp;▼<br>
+    + [CLS] token + Absolute Positional Embedding<br>
+    &nbsp;&nbsp;│<br>
+    &nbsp;&nbsp;▼<br>
+    <span style="color:#58a6ff;">Transformer Encoder × 6</span> &nbsp;(4 heads, MLP ratio 4)<br>
+    &nbsp;&nbsp;│<br>
+    &nbsp;&nbsp;▼<br>
+    [CLS] → Linear head → 10-class logits
+    </div>
+    """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="kv-divider"></div>
